@@ -11,12 +11,14 @@
  *
  * Relay inputs are assumed ACTIVE LOW.
  *
- * Each debounced button press selects the next mode:
+ * Each debounced short button click selects the next mode:
  *   1. light ON, fan OFF
  *   2. light ON, fan speed 1
  *   3. light ON, fan speed 2
  *   4. light ON, fan speed 3
- *   5. light OFF, fan OFF
+ *
+ * A button hold of approximately one second switches everything OFF and
+ * resets the short-click sequence. The next short click starts at mode 1.
  *
  * Design goals:
  *   - no blocking delays
@@ -85,13 +87,17 @@
 
 /*
  * Timer0: Fcy ~= 1 MHz, prescaler 1:256, overflow ~= 65.536 ms.
- * One quiet overflow validates a button state; three overflows provide
- * ~=196.6 ms fan break-before-make time. Timer0 is off when neither is needed.
+ * One quiet overflow validates a button state; the long-press state reaches
+ * its threshold after ~=0.98 s from the input edge; three overflows provide
+ * ~=196.6 ms fan break-before-make time.
+ * Timer0 is off when neither is needed.
  * Bit 7 is clear so the GPIO weak pull-ups (including GP5) stay enabled.
  */
 #define OPTION_T0                 0x07u  /* internal, prescaler 1:256, pull-ups ON */
 
 #define FAN_DEAD_OVERFLOWS        3u
+#define BUTTON_LONG_OVERFLOWS     16u   /* ~= 0.98 s from the input edge */
+#define BUTTON_HOLD_HANDLED       0xffu
 
 /* Packed state flags: saves 3 bytes of scarce PIC12F675 SRAM. */
 #define FLAG_RX_ACTIVE             0x01u
@@ -117,8 +123,15 @@ static volatile uint8_t fan_current;
 static volatile uint8_t fan_pending;
 static volatile uint8_t fan_dead_left;
 
-/* Button mode: 0..4 correspond to modes 1..5 listed above. */
+/* Button mode: 0..3 correspond to light, speed 1, speed 2 and speed 3. */
 static uint8_t button_mode;
+
+/*
+ * Button hold state. Zero means no stable press is being timed, 1..15 are
+ * elapsed Timer0 overflows, 16 means a long-press event is pending, and 0xff
+ * means the long press was already handled.
+ */
+static volatile uint8_t button_hold_ticks;
 
 /* Hash workspace kept global to reduce XC8 auto/parameter RAM pressure. */
 static uint32_t hash_value;
@@ -208,11 +221,14 @@ static void fan_request(uint8_t speed)
     state_flags &= (uint8_t)~FLAG_FAN_MAKE;
 
     if (speed == 0u) {
-        /* OFF is complete immediately; keep Timer0 only for debounce. */
-        if ((state_flags & FLAG_BUTTON_DEBOUNCE) == 0u) {
-            INTCONbits.T0IF = 0u;
-        } else {
+        /* OFF is complete immediately; preserve any active button timing. */
+        if (((state_flags & FLAG_BUTTON_DEBOUNCE) != 0u) ||
+            (((state_flags & FLAG_BUTTON_STABLE_HIGH) == 0u) &&
+             (button_hold_ticks != 0u) &&
+             (button_hold_ticks < BUTTON_LONG_OVERFLOWS))) {
             INTCONbits.T0IE = 1u;
+        } else {
+            INTCONbits.T0IF = 0u;
         }
 
         INTCONbits.GIE = 1u;
@@ -314,11 +330,6 @@ static void button_dispatch(void)
     state_flags &= (uint8_t)~FLAG_BUTTON_EVENT;
     INTCONbits.GIE = 1u;
 
-    if (button_mode >= 4u)
-        button_mode = 0u;
-    else
-        ++button_mode;
-
     if (button_mode == 0u) {
         fan_request(0u);
         light_set(1u);
@@ -331,10 +342,33 @@ static void button_dispatch(void)
     } else if (button_mode == 3u) {
         light_set(1u);
         fan_request(3u);
-    } else {
-        fan_request(0u);
-        light_set(0u);
     }
+
+    ++button_mode;
+    if (button_mode >= 4u)
+        button_mode = 0u;
+}
+
+static void button_long_dispatch(void)
+{
+    uint8_t hold_state;
+
+    INTCONbits.GIE = 0u;
+    hold_state = button_hold_ticks;
+
+    if ((state_flags & FLAG_BUTTON_EVENT) == 0u ||
+        (hold_state < BUTTON_LONG_OVERFLOWS)) {
+        INTCONbits.GIE = 1u;
+        return;
+    }
+
+    state_flags &= (uint8_t)~FLAG_BUTTON_EVENT;
+    button_hold_ticks = BUTTON_HOLD_HANDLED;
+    button_mode = 0u;
+    INTCONbits.GIE = 1u;
+
+    fan_request(0u);
+    light_set(0u);
 }
 
 /* --------------------------------------------------------------------- */
@@ -420,10 +454,29 @@ void __interrupt() isr(void)
                 state_flags &= (uint8_t)~FLAG_BUTTON_DEBOUNCE;
 
                 if ((state_flags & FLAG_BUTTON_CANDIDATE_HIGH) != 0u) {
+                    /* A short click is accepted only on button release. */
+                    if ((state_flags & FLAG_BUTTON_STABLE_HIGH) == 0u) {
+                        if ((button_hold_ticks != 0u) &&
+                            (button_hold_ticks < BUTTON_LONG_OVERFLOWS))
+                            state_flags |= FLAG_BUTTON_EVENT;
+
+                        if (button_hold_ticks < BUTTON_LONG_OVERFLOWS)
+                            button_hold_ticks = 0u;
+                        else
+                            button_hold_ticks = BUTTON_HOLD_HANDLED;
+                    }
+
                     state_flags |= FLAG_BUTTON_STABLE_HIGH;
                 } else if ((state_flags & FLAG_BUTTON_STABLE_HIGH) != 0u) {
+                    /* Stable press starts the long-press timer. */
                     state_flags &= (uint8_t)~FLAG_BUTTON_STABLE_HIGH;
-                    state_flags |= FLAG_BUTTON_EVENT;
+                    /* Preserve a pending long event across a rapid re-press. */
+                    if (((state_flags & FLAG_BUTTON_EVENT) == 0u) ||
+                        (button_hold_ticks < BUTTON_LONG_OVERFLOWS))
+                        button_hold_ticks = 1u;
+                } else if (button_hold_ticks == 0u) {
+                    /* Also handle a button that was already held at reset. */
+                    button_hold_ticks = 1u;
                 }
             } else {
                 if ((GPIO & BUTTON_MASK) != 0u)
@@ -435,6 +488,16 @@ void __interrupt() isr(void)
             }
         }
 
+        if (((state_flags & FLAG_BUTTON_DEBOUNCE) == 0u) &&
+            ((state_flags & FLAG_BUTTON_STABLE_HIGH) == 0u) &&
+            (button_hold_ticks != 0u) &&
+            (button_hold_ticks < BUTTON_LONG_OVERFLOWS)) {
+            ++button_hold_ticks;
+
+            if (button_hold_ticks >= BUTTON_LONG_OVERFLOWS)
+                state_flags |= FLAG_BUTTON_EVENT;
+        }
+
         if (fan_dead_left != 0u) {
             --fan_dead_left;
 
@@ -443,7 +506,9 @@ void __interrupt() isr(void)
         }
 
         if ((fan_dead_left == 0u) &&
-            ((state_flags & FLAG_BUTTON_DEBOUNCE) == 0u))
+            ((state_flags & FLAG_BUTTON_DEBOUNCE) == 0u) &&
+            (((state_flags & FLAG_BUTTON_STABLE_HIGH) != 0u) ||
+             (button_hold_ticks >= BUTTON_LONG_OVERFLOWS)))
             INTCONbits.T0IE = 0u;
     }
 }
@@ -578,14 +643,18 @@ static void init_hw(void)
     fan_dead_left = 0u;
 
     last_inputs = (uint8_t)(GPIO & INPUT_MASK);
+    button_hold_ticks = 0u;
 
     if ((last_inputs & BUTTON_MASK) != 0u) {
         state_flags |= FLAG_BUTTON_STABLE_HIGH;
         state_flags |= FLAG_BUTTON_CANDIDATE_HIGH;
+    } else {
+        /* Start timing if the button is already held during reset. */
+        button_hold_ticks = 1u;
     }
 
-    /* Power-up state is mode 5 (everything OFF); first press selects mode 1. */
-    button_mode = 4u;
+    /* Power-up state is OFF; the first short click selects mode 1. */
+    button_mode = 0u;
 
     IOC = INPUT_MASK;
 
@@ -595,7 +664,7 @@ static void init_hw(void)
     PIE1 = 0x00u;
     PIR1 = 0x00u;
 
-    INTCONbits.T0IE = 0u;
+    INTCONbits.T0IE = (button_hold_ticks != 0u) ? 1u : 0u;
     INTCONbits.GPIE = 1u;
     INTCONbits.PEIE = 0u;
     INTCONbits.GIE = 1u;
@@ -614,9 +683,13 @@ void main(void)
 
         ir_service();
 
-        /* Apply a debounced press before energizing a pending fan speed. */
-        if ((state_flags & FLAG_BUTTON_EVENT) != 0u)
-            button_dispatch();
+        /* Long press has priority over a short-click event. */
+        if ((state_flags & FLAG_BUTTON_EVENT) != 0u) {
+            if (button_hold_ticks >= BUTTON_LONG_OVERFLOWS)
+                button_long_dispatch();
+            else
+                button_dispatch();
+        }
 
         fan_service();
     }

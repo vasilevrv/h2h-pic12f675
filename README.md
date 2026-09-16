@@ -61,7 +61,7 @@ enables the PIC's internal GPIO pull-ups, so the released level is HIGH. For
 long or electrically noisy wiring, an external approximately `10 kOhm` pull-up
 from `GP5` to `VDD` is recommended.
 
-Each debounced press advances to the next mode and wraps after mode 5:
+Each debounced short click advances to the next mode and wraps back to mode 1:
 
 | Mode | Light | Fan     |
 | ---- | ----- | ------- |
@@ -69,16 +69,17 @@ Each debounced press advances to the next mode and wraps after mode 5:
 | 2    | ON    | Speed 1 |
 | 3    | ON    | Speed 2 |
 | 4    | ON    | Speed 3 |
-| 5    | OFF   | OFF     |
 
-After reset, all outputs are OFF. The first accepted press selects mode 1.
+After reset, all outputs are OFF. The first short click selects mode 1. A
+press held for approximately one second switches all outputs OFF and resets
+the button sequence; the next short click again selects mode 1.
 A new button level must remain unchanged for approximately `65 ms` before it
-is accepted. Only the stable released-to-pressed transition advances the mode,
-so holding the button does not repeat.
+is accepted. Short clicks are acted on at the stable pressed-to-released
+transition, so holding the button does not repeat. The long-press threshold is
+approximately `1 s` from the physical button press.
 
 The Hob2Hood IR receiver remains active and can still control the fan and light
-independently. The button cycle remembers the last mode selected by the button;
-IR commands do not change its position in the cycle.
+independently. IR commands do not change the button sequence position.
 
 ## Design Goals
 
@@ -86,7 +87,7 @@ IR commands do not change its position in the cycle.
 * IR edges have priority over background processing.
 * `Timer1` is dedicated exclusively to IR timing.
 * `Timer0` does not generate periodic interrupts while the system is idle.
-* Button debounce uses `Timer0` only while an input transition is settling.
+* Button debounce and long-press timing use `Timer0` only while needed.
 * Fan **break-before-make** switching uses `Timer0` only while a relay
   transition is pending.
 * A GPIO shadow register avoids PIC read-modify-write issues on relay outputs.
@@ -110,12 +111,12 @@ IR commands do not change its position in the cycle.
 | Resource | Purpose                                                |
 | -------- | ------------------------------------------------------ |
 | `Timer1` | Hob2Hood IR pulse timing                               |
-| `Timer0` | Button debounce and fan relay break-before-make timing |
+| `Timer0` | Button debounce/hold and fan break-before-make timing  |
 | `WDT`    | Recovery from firmware lockup                          |
 
-`Timer0` is inactive when neither debounce nor a relay transition requires it.
-This avoids unnecessary periodic interrupt activity and keeps IR processing
-deterministic.
+`Timer0` is inactive when no button debounce/hold or relay transition requires
+it. This avoids unnecessary periodic interrupt activity and keeps IR
+processing deterministic.
 
 ## Safety
 
