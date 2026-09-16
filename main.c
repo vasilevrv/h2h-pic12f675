@@ -1,33 +1,29 @@
 /*
  * Hob2Hood receiver - PIC12F675 - XC8
- * v4.4 FINAL + WDT - audited
+ * v4.5 BUTTON + WDT
  *
  * GP0 -> Fan 1 relay
  * GP1 -> Fan 2 relay
  * GP2 -> Fan 3 relay
  * GP3 <- IR receiver OUT
  * GP4 -> Light relay
- * GP5 <- TTL UART RX, 1200 baud, 8N1
+ * GP5 <- Push button to GND (internal pull-up enabled)
  *
  * Relay inputs are assumed ACTIVE LOW.
  *
- * UART commands:
- *   '0' = fan OFF
- *   '1' = fan speed 1
- *   '2' = fan speed 2
- *   '3' = fan speed 3
- *   '4' = fan speed 3 (Hob2Hood intensive -> max available)
- *   'L' = light ON
- *   'l' = light OFF
- *   'X' = fan OFF + light OFF
- *   Send discrete command bytes; this tiny MCU intentionally has no UART FIFO.
+ * Each debounced button press selects the next mode:
+ *   1. light ON, fan OFF
+ *   2. light ON, fan speed 1
+ *   3. light ON, fan speed 2
+ *   4. light ON, fan speed 3
+ *   5. light OFF, fan OFF
  *
  * Design goals:
  *   - no blocking delays
  *   - IR edges have priority
  *   - Timer1 is dedicated to IR timing
  *   - Timer0 interrupts are NOT periodic while idle
- *   - UART uses Timer0 only while a byte is actually being received
+ *   - button debounce is non-blocking and uses Timer0 only while needed
  *   - fan break-before-make uses Timer0 only while a transition is pending
  *   - GPIO shadow avoids PIC read-modify-write surprises on relay outputs
  *   - watchdog enabled; deliberately cleared only from healthy main-line code
@@ -35,7 +31,8 @@
  *     to Timer0; nominal WDT timeout is ~18 ms (device-dependent)
  *
  * IMPORTANT HARDWARE REQUIREMENTS:
- *   - external ~10 kOhm pull-up on GP5/UART RX if the UART source may unplug
+ *   - connect a normally-open button between GP5 and GND
+ *   - an external ~10 kOhm pull-up on GP5 is recommended in noisy wiring
  *   - relay inputs must be held OFF during PIC reset (e.g. pull-ups for
  *     active-low relay board)
  *   - use a hardware interlock on the mains/motor side; software is secondary
@@ -64,9 +61,9 @@
 #define FAN3_MASK                0x04u  /* GP2 */
 #define IR_MASK                  0x08u  /* GP3 */
 #define LIGHT_MASK               0x10u  /* GP4 */
-#define UART_RX_MASK             0x20u  /* GP5 */
+#define BUTTON_MASK              0x20u  /* GP5, active LOW */
 
-#define INPUT_MASK               (IR_MASK | UART_RX_MASK)
+#define INPUT_MASK               (IR_MASK | BUTTON_MASK)
 #define FAN_MASK                 (FAN1_MASK | FAN2_MASK | FAN3_MASK)
 #define RELAY_MASK               (FAN_MASK | LIGHT_MASK)
 
@@ -87,36 +84,12 @@
 #define FNV_PRIME_32             16777619UL
 
 /*
- * Timer0 modes.
- *
- * FAN mode:
- *   Fcy ~= 1 MHz, prescaler 1:256
- *   overflow ~= 65.536 ms
- *   3 overflows ~= 196.6 ms dead time
- *
- * UART mode:
- *   Fcy ~= 1 MHz, prescaler 1:8
- *
- *   Start-bit verification:
- *     preload 204 -> about 418 us, near the middle of the start bit.
- *
- *   Data-bit spacing:
- *     preload/add 152 -> about 834 us, close to 833.33 us at 1200 baud.
- *
- *   After the first overflow we add the preload to the current TMR0 value
- *   rather than blindly overwriting it. This compensates most ISR latency
- *   and prevents sampling phase error from accumulating across the byte.
+ * Timer0: Fcy ~= 1 MHz, prescaler 1:256, overflow ~= 65.536 ms.
+ * One quiet overflow validates a button state; three overflows provide
+ * ~=196.6 ms fan break-before-make time. Timer0 is off when neither is needed.
+ * Bit 7 is clear so the GPIO weak pull-ups (including GP5) stay enabled.
  */
-#define T0_MODE_IDLE              0u
-#define T0_MODE_FAN               1u
-#define T0_MODE_UART              2u
-
-#define OPTION_T0_FAN             0x87u  /* internal, prescaler 1:256 */
-#define OPTION_T0_UART            0x82u  /* internal, prescaler 1:8 */
-
-#define UART_START_PRELOAD        204u
-#define UART_BIT_PRELOAD          152u
-#define UART_STATE_VERIFY_START   0xFFu
+#define OPTION_T0                 0x07u  /* internal, prescaler 1:256, pull-ups ON */
 
 #define FAN_DEAD_OVERFLOWS        3u
 
@@ -124,9 +97,11 @@
 #define FLAG_RX_ACTIVE             0x01u
 #define FLAG_RX_BAD                0x02u
 #define FLAG_FAN_MAKE              0x04u
-#define FLAG_UART_ACTIVE           0x08u
-#define FLAG_UART_READY            0x10u
+#define FLAG_BUTTON_DEBOUNCE       0x08u
+#define FLAG_BUTTON_EVENT          0x10u
 #define FLAG_IR_LOCK               0x20u  /* rx_buf/hash protected; discard IR edges */
+#define FLAG_BUTTON_STABLE_HIGH    0x40u
+#define FLAG_BUTTON_CANDIDATE_HIGH 0x80u
 
 /* Global state: PIC12F675 has only 64 bytes of SRAM. */
 static volatile uint8_t gpio_shadow;
@@ -142,10 +117,8 @@ static volatile uint8_t fan_current;
 static volatile uint8_t fan_pending;
 static volatile uint8_t fan_dead_left;
 
-/* Timer0/UART */
-static volatile uint8_t t0_mode;
-static volatile uint8_t uart_bit;
-static volatile uint8_t uart_byte;
+/* Button mode: 0..4 correspond to modes 1..5 listed above. */
+static uint8_t button_mode;
 
 /* Hash workspace kept global to reduce XC8 auto/parameter RAM pressure. */
 static uint32_t hash_value;
@@ -189,53 +162,13 @@ static void light_set(uint8_t on)
     gpio_commit();
 }
 
-/* Start/restart Timer0 in fan dead-time mode. Call with T0IE disabled. */
-static void timer0_start_fan(void)
+/* Start/restart the shared fan/debounce timer. Call with T0IE disabled. */
+static void timer0_start(void)
 {
-    OPTION_REG = OPTION_T0_FAN;
+    OPTION_REG = OPTION_T0;
     TMR0 = 0u;
     INTCONbits.T0IF = 0u;
-    t0_mode = T0_MODE_FAN;
     INTCONbits.T0IE = 1u;
-}
-
-/* Start UART timing from a detected falling start edge. */
-static void timer0_start_uart(void)
-{
-    INTCONbits.T0IE = 0u;
-
-    OPTION_REG = OPTION_T0_UART;
-    TMR0 = UART_START_PRELOAD;
-    INTCONbits.T0IF = 0u;
-    t0_mode = T0_MODE_UART;
-
-    INTCONbits.T0IE = 1u;
-}
-
-/*
- * Restore fan dead-time timer after UART. If no fan transition is pending,
- * Timer0 interrupt is left disabled, minimizing IR-capture jitter.
- */
-static void timer0_after_uart(void)
-{
-    INTCONbits.T0IE = 0u;
-
-    if (fan_dead_left != 0u) {
-        /*
-         * Inline the fan Timer0 setup here rather than calling
-         * timer0_start_fan(): this function runs from the ISR call graph,
-         * while timer0_start_fan() is used from main context. Keeping the
-         * call graphs separate avoids XC8 duplicating a non-reentrant helper.
-         */
-        OPTION_REG = OPTION_T0_FAN;
-        TMR0 = 0u;
-        INTCONbits.T0IF = 0u;
-        t0_mode = T0_MODE_FAN;
-        INTCONbits.T0IE = 1u;
-    } else {
-        t0_mode = T0_MODE_IDLE;
-        INTCONbits.T0IF = 0u;
-    }
 }
 
 static void fan_request(uint8_t speed)
@@ -275,12 +208,8 @@ static void fan_request(uint8_t speed)
     state_flags &= (uint8_t)~FLAG_FAN_MAKE;
 
     if (speed == 0u) {
-        /*
-         * OFF is complete immediately. If UART owns Timer0, leave it alone;
-         * otherwise Timer0 stays idle.
-         */
-        if ((state_flags & FLAG_UART_ACTIVE) == 0u) {
-            t0_mode = T0_MODE_IDLE;
+        /* OFF is complete immediately; keep Timer0 only for debounce. */
+        if ((state_flags & FLAG_BUTTON_DEBOUNCE) == 0u) {
             INTCONbits.T0IF = 0u;
         } else {
             INTCONbits.T0IE = 1u;
@@ -291,38 +220,18 @@ static void fan_request(uint8_t speed)
     }
 
     fan_dead_left = FAN_DEAD_OVERFLOWS;
-
-    /*
-     * UART owns Timer0 while receiving. Fan dead-time is safely paused and
-     * starts/restarts after the byte completes.
-     */
-    if ((state_flags & FLAG_UART_ACTIVE) != 0u) {
-        INTCONbits.T0IE = 1u;
-        INTCONbits.GIE = 1u;
-        return;
-    }
-
-    timer0_start_fan();
+    timer0_start();
     INTCONbits.GIE = 1u;
 }
 
 static void fan_service(void)
 {
-    /*
-     * Fast-path check first. Then re-check BOTH conditions atomically after
-     * masking interrupts: a UART start edge can occur between the first test
-     * and GIE=0. Without the second UART_ACTIVE check, an old pending speed
-     * could be energized for a few milliseconds while a new UART command is
-     * already being received.
-     */
-    if (((state_flags & FLAG_FAN_MAKE) == 0u) ||
-        ((state_flags & FLAG_UART_ACTIVE) != 0u))
+    if ((state_flags & FLAG_FAN_MAKE) == 0u)
         return;
 
     INTCONbits.GIE = 0u;
 
-    if (((state_flags & FLAG_FAN_MAKE) != 0u) &&
-        ((state_flags & FLAG_UART_ACTIVE) == 0u)) {
+    if ((state_flags & FLAG_FAN_MAKE) != 0u) {
         state_flags &= (uint8_t)~FLAG_FAN_MAKE;
 
         if (fan_pending != 0u) {
@@ -399,28 +308,33 @@ static void dispatch_hash(void)
         light_set(0u);
 }
 
-static void uart_dispatch(void)
+static void button_dispatch(void)
 {
-    if (uart_byte == '0')
+    INTCONbits.GIE = 0u;
+    state_flags &= (uint8_t)~FLAG_BUTTON_EVENT;
+    INTCONbits.GIE = 1u;
+
+    if (button_mode >= 4u)
+        button_mode = 0u;
+    else
+        ++button_mode;
+
+    if (button_mode == 0u) {
         fan_request(0u);
-    else if (uart_byte == '1')
-        fan_request(1u);
-    else if (uart_byte == '2')
-        fan_request(2u);
-    else if ((uart_byte == '3') || (uart_byte == '4'))
-        fan_request(3u);
-    else if (uart_byte == 'L')
         light_set(1u);
-    else if (uart_byte == 'l')
-        light_set(0u);
-    else if (uart_byte == 'X') {
+    } else if (button_mode == 1u) {
+        light_set(1u);
+        fan_request(1u);
+    } else if (button_mode == 2u) {
+        light_set(1u);
+        fan_request(2u);
+    } else if (button_mode == 3u) {
+        light_set(1u);
+        fan_request(3u);
+    } else {
         fan_request(0u);
         light_set(0u);
     }
-
-    INTCONbits.GIE = 0u;
-    state_flags &= (uint8_t)~FLAG_UART_READY;
-    INTCONbits.GIE = 1u;
 }
 
 /* --------------------------------------------------------------------- */
@@ -429,7 +343,7 @@ void __interrupt() isr(void)
 {
     /*
      * Shared GPIO interrupt-on-change.
-     * GP3 = IR, GP5 = UART RX.
+     * GP3 = IR, GP5 = push button.
      */
     if (INTCONbits.GPIF != 0u) {
         uint8_t pins;
@@ -445,7 +359,7 @@ void __interrupt() isr(void)
 
         /*
          * IR edge: Timer1 is stopped immediately before read/reset.
-         * UART edges never reset Timer1.
+         * Button edges never reset Timer1.
          */
         if (((changed & IR_MASK) != 0u) &&
             ((state_flags & FLAG_IR_LOCK) == 0u)) {
@@ -472,25 +386,24 @@ void __interrupt() isr(void)
         }
 
         /*
-         * UART start edge. Disable GP5 IOC while receiving the byte so
-         * data-bit transitions do not generate useless GPIO interrupts.
+         * Every button edge restarts a quiet-time interval. Only a level that
+         * remains unchanged for a complete Timer0 period is accepted.
+         * Restarting Timer0 may only lengthen an active fan dead time, which
+         * is safe for the mutually exclusive speed relays.
          */
-        if (((changed & UART_RX_MASK) != 0u) &&
-            ((old_inputs & UART_RX_MASK) != 0u) &&
-            ((pins & UART_RX_MASK) == 0u) &&
-            ((state_flags & FLAG_UART_ACTIVE) == 0u) &&
-            ((state_flags & FLAG_UART_READY) == 0u)) {
-
-            state_flags |= FLAG_UART_ACTIVE;
-            uart_bit = UART_STATE_VERIFY_START;
-            uart_byte = 0u;
-
-            if ((state_flags & FLAG_IR_LOCK) != 0u)
-                IOC = 0u;
+        if ((changed & BUTTON_MASK) != 0u) {
+            if ((pins & BUTTON_MASK) != 0u)
+                state_flags |= FLAG_BUTTON_CANDIDATE_HIGH;
             else
-                IOC = IR_MASK;
+                state_flags &= (uint8_t)~FLAG_BUTTON_CANDIDATE_HIGH;
 
-            timer0_start_uart();
+            state_flags |= FLAG_BUTTON_DEBOUNCE;
+
+            INTCONbits.T0IE = 0u;
+            OPTION_REG = OPTION_T0;
+            TMR0 = 0u;
+            INTCONbits.T0IF = 0u;
+            INTCONbits.T0IE = 1u;
         }
 
         INTCONbits.GPIF = 0u;
@@ -499,94 +412,39 @@ void __interrupt() isr(void)
     if (INTCONbits.T0IF != 0u) {
         INTCONbits.T0IF = 0u;
 
-        if (t0_mode == T0_MODE_UART) {
-            /*
-             * First overflow verifies that the start bit is still LOW near
-             * its center. This rejects short glitches on the UART input.
-             */
-            if (uart_bit == UART_STATE_VERIFY_START) {
-                if ((GPIO & UART_RX_MASK) == 0u) {
-                    uart_bit = 0u;
+        if ((state_flags & FLAG_BUTTON_DEBOUNCE) != 0u) {
+            if ((((GPIO & BUTTON_MASK) != 0u) &&
+                 ((state_flags & FLAG_BUTTON_CANDIDATE_HIGH) != 0u)) ||
+                (((GPIO & BUTTON_MASK) == 0u) &&
+                 ((state_flags & FLAG_BUTTON_CANDIDATE_HIGH) == 0u))) {
+                state_flags &= (uint8_t)~FLAG_BUTTON_DEBOUNCE;
 
-                    /*
-                     * Phase-corrected reload: account for Timer0 counts that
-                     * accumulated between overflow and ISR service.
-                     */
-                    TMR0 = (uint8_t)(TMR0 + UART_BIT_PRELOAD);
-                } else {
-                    /* False start/glitch: abort without producing a byte. */
-                    state_flags &= (uint8_t)~FLAG_UART_ACTIVE;
-
-                    /*
-                     * GP5 IOC was disabled during byte reception. Refresh only
-                     * the GP5 software baseline. Preserve the GP3 baseline:
-                     * an IR edge may have happened after the GPIF check at ISR
-                     * entry. Do NOT clear GPIF here; if such an IR edge is
-                     * pending, the ISR will immediately run again and process it.
-                     */
-                    last_inputs = (uint8_t)((last_inputs & IR_MASK) |
-                                             (GPIO & UART_RX_MASK));
-
-                    if ((state_flags & FLAG_IR_LOCK) != 0u)
-                        IOC = UART_RX_MASK;
-                    else
-                        IOC = INPUT_MASK;
-
-                    timer0_after_uart();
+                if ((state_flags & FLAG_BUTTON_CANDIDATE_HIGH) != 0u) {
+                    state_flags |= FLAG_BUTTON_STABLE_HIGH;
+                } else if ((state_flags & FLAG_BUTTON_STABLE_HIGH) != 0u) {
+                    state_flags &= (uint8_t)~FLAG_BUTTON_STABLE_HIGH;
+                    state_flags |= FLAG_BUTTON_EVENT;
                 }
-            } else if (uart_bit < 8u) {
-                if ((GPIO & UART_RX_MASK) != 0u)
-                    uart_byte |= (uint8_t)(1u << uart_bit);
-
-                ++uart_bit;
-
-                /*
-                 * Keep the next sample phase referenced to the previous
-                 * overflow rather than to ISR completion.
-                 */
-                TMR0 = (uint8_t)(TMR0 + UART_BIT_PRELOAD);
             } else {
-                /* Stop bit must be HIGH. */
-                if ((GPIO & UART_RX_MASK) != 0u)
-                    state_flags |= FLAG_UART_READY;
-
-                state_flags &= (uint8_t)~FLAG_UART_ACTIVE;
-
-                /*
-                 * Re-arm GP5 IOC from the current pin state.
-                 */
-                /*
-                 * Preserve the GP3 software baseline and any pending GPIF.
-                 * This prevents a Timer0/UART completion interrupt from
-                 * swallowing an IR edge that arrived during this ISR.
-                 */
-                last_inputs = (uint8_t)((last_inputs & IR_MASK) |
-                                         (GPIO & UART_RX_MASK));
-
-                if ((state_flags & FLAG_IR_LOCK) != 0u)
-                    IOC = UART_RX_MASK;
+                if ((GPIO & BUTTON_MASK) != 0u)
+                    state_flags |= FLAG_BUTTON_CANDIDATE_HIGH;
                 else
-                    IOC = INPUT_MASK;
+                    state_flags &= (uint8_t)~FLAG_BUTTON_CANDIDATE_HIGH;
 
-                timer0_after_uart();
+                TMR0 = 0u;
             }
-        } else if (t0_mode == T0_MODE_FAN) {
-            if (fan_dead_left != 0u) {
-                --fan_dead_left;
-
-                if (fan_dead_left == 0u) {
-                    state_flags |= FLAG_FAN_MAKE;
-                    t0_mode = T0_MODE_IDLE;
-                    INTCONbits.T0IE = 0u;
-                }
-            } else {
-                t0_mode = T0_MODE_IDLE;
-                INTCONbits.T0IE = 0u;
-            }
-        } else {
-            /* Defensive: no Timer0 interrupt is expected in IDLE mode. */
-            INTCONbits.T0IE = 0u;
         }
+
+        if (fan_dead_left != 0u) {
+            --fan_dead_left;
+
+            if (fan_dead_left == 0u)
+                state_flags |= FLAG_FAN_MAKE;
+        }
+
+        if ((fan_dead_left == 0u) &&
+            ((state_flags & FLAG_BUTTON_DEBOUNCE) == 0u))
+            INTCONbits.T0IE = 0u;
     }
 }
 
@@ -620,9 +478,9 @@ static void ir_service(void)
     /*
      * Freeze the completed IR frame while it is hashed.
      *
-     * FLAG_IR_LOCK is important: UART can start/finish while calculate_hash()
-     * runs. UART ISR paths must not accidentally re-enable GP3 and allow a
-     * new IR frame to overwrite rx_buf/rx_count while the hash reads them.
+     * FLAG_IR_LOCK prevents a new IR frame from overwriting rx_buf/rx_count
+     * while calculate_hash() reads them. Button interrupt-on-change remains
+     * enabled during this short interval.
      */
     INTCONbits.GIE = 0u;
 
@@ -636,17 +494,8 @@ static void ir_service(void)
     state_flags |= FLAG_IR_LOCK;
     state_flags &= (uint8_t)~FLAG_RX_ACTIVE;
 
-    /*
-     * Keep UART start detection available while hashing if UART is idle.
-     * GP3 is disabled until FLAG_IR_LOCK is cleared.
-     *
-     * Do not clear GPIF here. If a UART edge became pending in this tiny
-     * critical section, leaving GPIF set lets the ISR process it afterward.
-     */
-    if ((state_flags & FLAG_UART_ACTIVE) != 0u)
-        IOC = 0u;
-    else
-        IOC = UART_RX_MASK;
+    /* Keep the button enabled; GP3 stays disabled until hashing is complete. */
+    IOC = BUTTON_MASK;
 
     INTCONbits.GIE = 1u;
 
@@ -660,28 +509,25 @@ static void ir_service(void)
     /*
      * Re-arm GP3 after hash processing. While GP3 was locked, IR edges were
      * intentionally discarded. Establish a fresh GP3 baseline and preserve
-     * GP5's software baseline so a pending UART falling edge is not erased.
+     * GP5's button baseline so a pending button edge is not erased.
      */
     INTCONbits.GIE = 0u;
 
     TMR1H = 0u;
     TMR1L = 0u;
 
-    last_inputs = (uint8_t)((last_inputs & UART_RX_MASK) |
+    last_inputs = (uint8_t)((last_inputs & BUTTON_MASK) |
                              (GPIO & IR_MASK));
 
     state_flags &= (uint8_t)~FLAG_IR_LOCK;
 
-    if ((state_flags & FLAG_UART_ACTIVE) != 0u)
-        IOC = IR_MASK;
-    else
-        IOC = INPUT_MASK;
+    IOC = INPUT_MASK;
 
     /*
-     * Intentionally do not clear GPIF. A UART/IR change that happened during
+     * Intentionally do not clear GPIF. A button/IR change that happened during
      * this short critical section will cause an immediate ISR pass. Because
      * GP3's software baseline was refreshed above, any stale IR-only flag is
-     * harmless, while a pending GP5 falling edge remains detectable.
+     * harmless, while a pending GP5 button edge remains detectable.
      */
     INTCONbits.GIE = 1u;
 }
@@ -707,6 +553,9 @@ static void init_hw(void)
     /* GP3 and GP5 inputs; GP0/1/2/4 outputs. */
     TRISIO = 0x28u;
 
+    /* Select the GP5 weak pull-up; OPTION_T0 enables it globally below. */
+    WPU = BUTTON_MASK;
+
     /* Timer1: internal Fosc/4, prescaler 1:1 ~= 1 us/tick. */
     T1CON = 0x01u;
     TMR1H = 0u;
@@ -718,9 +567,8 @@ static void init_hw(void)
      * WDT -> Timer0. After this point WDT runs without a prescaler.
      */
     CLRWDT();
-    OPTION_REG = OPTION_T0_FAN;
+    OPTION_REG = OPTION_T0;
     TMR0 = 0u;
-    t0_mode = T0_MODE_IDLE;
 
     state_flags = 0u;
     rx_count = 0u;
@@ -729,10 +577,15 @@ static void init_hw(void)
     fan_pending = 0u;
     fan_dead_left = 0u;
 
-    uart_bit = 0u;
-    uart_byte = 0u;
-
     last_inputs = (uint8_t)(GPIO & INPUT_MASK);
+
+    if ((last_inputs & BUTTON_MASK) != 0u) {
+        state_flags |= FLAG_BUTTON_STABLE_HIGH;
+        state_flags |= FLAG_BUTTON_CANDIDATE_HIGH;
+    }
+
+    /* Power-up state is mode 5 (everything OFF); first press selects mode 1. */
+    button_mode = 4u;
 
     IOC = INPUT_MASK;
 
@@ -761,13 +614,9 @@ void main(void)
 
         ir_service();
 
-        /*
-         * Apply a completed UART command before fan_service(). If dead-time
-         * expired at the same instant as a new manual command arrived, the
-         * newest command wins without briefly energizing the old pending speed.
-         */
-        if ((state_flags & FLAG_UART_READY) != 0u)
-            uart_dispatch();
+        /* Apply a debounced press before energizing a pending fan speed. */
+        if ((state_flags & FLAG_BUTTON_EVENT) != 0u)
+            button_dispatch();
 
         fan_service();
     }
